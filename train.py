@@ -1,4 +1,3 @@
-import math
 import sys
 from dataclasses import dataclass
 
@@ -6,6 +5,7 @@ import torch
 import tiktoken
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.nn.utils import clip_grad_norm_
 
 
 class DataloaderLite:
@@ -35,7 +35,7 @@ class DataloaderLite:
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    vocab_size: int = 50257 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
     n_head: int = 12
     n_embed: int = 768
@@ -69,13 +69,12 @@ class CausalSelfAttention(nn.Module):
         v = v.view(b, t,  self.n_head, c // self.n_head).transpose(1, 2) #(B, nh, T, hs)
         q = q.view(b, t,  self.n_head, c // self.n_head).transpose(1, 2) #(B, nh, T, hs)
         
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:t,:t] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
+        # self attention implementation with flash attention
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         
-        y = att @ v # (B, nh, T, T) * (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(b, t, c) # re-assemble all head outputs side by side
+        # re-assemble all head outputs side by side
         # output projection
+        y = y.transpose(1, 2).contiguous().view(b, t, c) 
         y = self.c_proj(y)
         return y
         
@@ -159,7 +158,7 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def generate(self, idx, max_new_tokens, temperature=1, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
         """
         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
@@ -210,7 +209,7 @@ model.to(device)
 torch.compile(model)
 
 #optimize
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
 for i in range(50):
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device)
@@ -218,6 +217,7 @@ for i in range(50):
     with torch.autocast(device_type=device, dtype=torch.bfloat16): 
         logits, loss = model(x,y)
     loss.backward()
+    clip_grad_norm_(model.parameters(), 1.0)
     optimizer.step()
     print(f"Step {i} \t Loss = {loss.item()}")
 
