@@ -1,13 +1,16 @@
+# Run fineweb_download.py to first get fineweb data to use with you model when training
 # Trained in Fine-Web Edu 10 billlion tokens
 import sys
 import os
 import math
 import inspect
 import time
+import multiprocessing as mp
 from dataclasses import dataclass
 
 import torch
 import tiktoken
+from tqdm import tqdm
 from datasets import load_dataset
 import numpy as np
 import torch.nn as nn
@@ -52,7 +55,7 @@ MAX_STEPS = 19073 # 10b tokens divided by 0.5M batch size
 MAX_LR = 6e-4 # as per gpt3 paper
 MIN_LR = MAX_LR * 0.1 # as per gpt3 paper
 WARM_STEPS = 715 # as per gpt3 paper
-MICRO_BATCH_SIZE = 16
+MICRO_BATCH_SIZE = 64 # you can adjust this in multiples of 16 until what fits your GPU well
 SEQUENCE_LENGTH = 1024
 GRAD_ACCUM_STEPS = TOTAL_BATCH_SIZE // (MICRO_BATCH_SIZE * SEQUENCE_LENGTH * ddp_world_size)
 
@@ -74,34 +77,7 @@ class GPTTrainingUtilities:
         coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts from 1 and goes to 0
         return MIN_LR + coeff * (MAX_LR - MIN_LR)
     
-    @staticmethod
-    def load_tokens(filename):
-        npt = np.load(filename)
-        npt = npt.astype(np.int32) # added after video
-        ptt = torch.tensor(npt, dtype=torch.long)
-        return ptt
     
-    @staticmethod
-    def download_data():
-        local_dir = "edu-fineweb10B"
-        remote_name = "sample=10BT"
-        shard_size = int(1e8) # 100M tokens per shard, total 100 shards
-        
-        DATA_CACHE_DIR = os.path.join(os.path.dirname(__name__), local_dir)
-        os.makedirs(DATA_CACHE_DIR, exist_ok=True)
-        
-        fw = load_dataset("HuggingFaceFW/fineweb", name=remote_name, split='train')
-    
-    @staticmethod
-    def tokenize():
-        # init the tokenizer
-        enc = tiktoken.get_encoding('gpt2')
-        eot = enc._special_tokens['<|endoftext|>'] # end of text token
-        
-        
-        
-        
-        
 class DataloaderLite:
     def __init__(self, b, t, process_rank, num_of_processes, split):
         self.b = b
@@ -125,8 +101,14 @@ class DataloaderLite:
     def reset(self):
         # state, init at shard zero
         self.current_shard = 0
-        self.tokens = GPTTrainingUtilities.load_tokens(self.shards[self.current_shard])
+        self.tokens = self.load_tokens(self.shards[self.current_shard])
         self.current_position = self.B * self.T * self.process_rank
+    
+    def load_tokens(filename):
+        npt = np.load(filename)
+        npt = npt.astype(np.int32) # added after video
+        ptt = torch.tensor(npt, dtype=torch.long)
+        return ptt
         
     
     def next_batch(self):
@@ -138,7 +120,7 @@ class DataloaderLite:
         # if loading the next batch is out of bounds, reset
         if self.current_position + ((self.b * self.t * self.num_of_processes) + 1) > len(self.tokens):
             self.current_shard = (self.current_shard + 1) % len(self.shards)
-            self.tokens = GPTTrainingUtilities.load_tokens(self.shards[self.current_shard])
+            self.tokens = self.load_tokens(self.shards[self.current_shard])
             self.current_position = self.b * self.t * self.process_rank
         return x, y
     
@@ -327,11 +309,17 @@ if torch.cuda.is_available():
 assert TOTAL_BATCH_SIZE % (MICRO_BATCH_SIZE * SEQUENCE_LENGTH * ddp_world_size) == 0, "Make sure total batch size is divisible by MICRO_BATCH_SIZE * SEQUENCE_LENGTH * ddp_world_size"
 torch.set_float32_matmul_precision('high')
 train_loader = DataloaderLite(16, 1024, ddp_rank, ddp_world_size, 'train')
+val_loader = DataloaderLite(16, 1024, ddp_rank, ddp_world_size, 'val')
 
 # get logits
 model = GPT(GPTConfig())
 model.to(device)
 model = torch.compile(model)
+
+use_compile = False # torch.compile interferes with HellaSwag eval and Generation. TODO fix
+if use_compile:
+    model = torch.compile(model)
+    
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
@@ -349,6 +337,64 @@ with open(log_file, "w") as f: # open for writing to clear the file
 
 for step in range(MAX_STEPS): 
     t0 = time.time()
+    last_step = (step == MAX_STEPS - 1)
+    # once in a while evaluate our validation loss
+    if step % 100 == 0:
+        model.eval()
+        val_loader.reset()
+        with torch.no_grad():
+            val_loss_accum = 0.0
+            val_loss_steps = 20
+            for _ in range(val_loss_steps):
+                x, y = val_loader.next_batch()
+                x, y = x.to(device), y.to(device)
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    logits, loss = model(x, y)
+                loss = loss / val_loss_steps
+                val_loss_accum += loss.detach()
+        if ddp:
+            all_reduce(val_loss_accum, op=ReduceOp.AVG)
+        if master_process:
+            print(f"validation loss: {val_loss_accum.item():.4f}")     
+            
+    # once in a while generate from the model (except step 0, which is noise)
+    if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
+        enc = tiktoken.get_encoding('gpt2')
+        model.eval()
+        num_return_sequences = 4
+        max_length = 32
+        tokens = enc.encode("Hello, I'm a language model,")
+        tokens = torch.tensor(tokens, dtype=torch.long)
+        tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1)
+        xgen = tokens.to(device)
+        sample_rng = torch.Generator(device=device)
+        sample_rng.manual_seed(42 + ddp_rank)
+        while xgen.size(1) < max_length:
+            # forward the model to get the logits
+            with torch.no_grad():
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    logits, loss = model(xgen) # (B, T, vocab_size)
+                # take the logits at the last position
+                logits = logits[:, -1, :] # (B, vocab_size)
+                # get the probabilities
+                probs = F.softmax(logits, dim=-1)
+                # do top-k sampling of 50 (huggingface pipeline default)
+                # topk_probs here becomes (5, 50), topk_indices is (5, 50)
+                topk_probs, topk_indices = torch.topk(probs, 50, dim=-1)
+                # select a token from the top-k probabilities
+                # note: multinomial does not demand the input to sum to 1
+                ix = torch.multinomial(topk_probs, 1, generator=sample_rng) # (B, 1)
+                # gather the corresponding indices
+                xcol = torch.gather(topk_indices, -1, ix) # (B, 1)
+                # append to the sequence
+                xgen = torch.cat((xgen, xcol), dim=1)
+        # print the generated text
+        for i in range(num_return_sequences):
+            tokens = xgen[i, :max_length].tolist()
+            decoded = enc.decode(tokens)
+            print(f"rank {ddp_rank} sample {i}: {decoded}")
+
+    
     optimizer.zero_grad()
     loss_accum = 0.0
     # Use gradient accumulation since a batch size of 0.5M is too big to fit in our GPUs
