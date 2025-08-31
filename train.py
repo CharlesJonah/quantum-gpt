@@ -396,6 +396,7 @@ for step in range(MAX_STEPS):
             print(f"rank {ddp_rank} sample {i}: {decoded}")
 
     
+    model.train()
     optimizer.zero_grad()
     loss_accum = 0.0
     # Use gradient accumulation since a batch size of 0.5M is too big to fit in our GPUs
