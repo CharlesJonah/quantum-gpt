@@ -338,8 +338,9 @@ with open(log_file, "w") as f: # open for writing to clear the file
 for step in range(MAX_STEPS): 
     t0 = time.time()
     last_step = (step == MAX_STEPS - 1)
+    
     # once in a while evaluate our validation loss
-    if step % 100 == 0:
+    if step % 250 == 0 or last_step:
         model.eval()
         val_loader.reset()
         with torch.no_grad():
