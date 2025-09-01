@@ -5,19 +5,19 @@ import os
 import math
 import inspect
 import time
-import multiprocessing as mp
+import random
 from dataclasses import dataclass
 
 import torch
 import tiktoken
-from tqdm import tqdm
-from datasets import load_dataset
 import numpy as np
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.nn.utils import clip_grad_norm_
 from torch.distributed import init_process_group, destroy_process_group, all_reduce, ReduceOp
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+from hellaswag import render_example, iterate_examples
 
 
 # Setup DDP(Distributed Data Parallel)      
@@ -55,9 +55,31 @@ MAX_STEPS = 19073 # 10b tokens divided by 0.5M batch size
 MAX_LR = 6e-4 # as per gpt3 paper
 MIN_LR = MAX_LR * 0.1 # as per gpt3 paper
 WARM_STEPS = 715 # as per gpt3 paper
-MICRO_BATCH_SIZE = 64 # you can adjust this in multiples of 16 until what fits your GPU well
-SEQUENCE_LENGTH = 1024
+MICRO_BATCH_SIZE = 32 # you can adjust this in multiples of 16 until what fits your GPU well
+SEQUENCE_LENGTH = 2048
 GRAD_ACCUM_STEPS = TOTAL_BATCH_SIZE // (MICRO_BATCH_SIZE * SEQUENCE_LENGTH * ddp_world_size)
+
+class GPTEvalUtilities:
+    
+    @staticmethod
+    def get_most_likely_row(tokens, mask, logits):
+        # evaluate the autoregressive loss at all positions
+        shift_logits = (logits[..., :-1, :]).contiguous()
+        shift_tokens = (tokens[..., 1:]).contiguous()
+        flat_shift_logits = shift_logits.view(-1, shift_logits.size(-1))
+        flat_shift_tokens = shift_tokens.view(-1)
+        shift_losses = F.cross_entropy(flat_shift_logits, flat_shift_tokens, reduction='none')
+        shift_losses = shift_losses.view(tokens.size(0), -1)
+        # now get the average loss just for the completion region (where mask == 1), in each row
+        shift_mask = (mask[..., 1:]).contiguous() # we must shift mask, so we start at the last prompt token
+        masked_shift_losses = shift_losses * shift_mask
+        # sum and divide by the number of 1s in the mask
+        sum_loss = masked_shift_losses.sum(dim=1)
+        avg_loss = sum_loss / shift_mask.sum(dim=1)
+        # now we have a loss for each of the 4 completions
+        # the one with the lowest loss should be the most likely
+        pred_norm = avg_loss.argmin().item()
+        return pred_norm
 
 class GPTTrainingUtilities:
     
@@ -325,7 +347,7 @@ if ddp:
 
 raw_model  = model.module if ddp else model
 
-#optimize
+# optimize
 optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device=device)
 
 # create the log directory we will write checkpoints to and log to
@@ -356,7 +378,59 @@ for step in range(MAX_STEPS):
         if ddp:
             all_reduce(val_loss_accum, op=ReduceOp.AVG)
         if master_process:
-            print(f"validation loss: {val_loss_accum.item():.4f}")     
+            print(f"validation loss: {val_loss_accum.item():.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+            if step > 0 and (step % 5000 == 0 or last_step):
+                # optionally write model checkpoints
+                checkpoint_path = os.path.join(log_dir, f"model_{step:05d}.pt")
+                checkpoint = {
+                    'model': raw_model.state_dict(),
+                    'config': raw_model.config,
+                    'step': step,
+                    'val_loss': val_loss_accum.item(),
+                    'optimizer': optimizer.state_dict(),
+                    "rng": {
+                        "torch": torch.get_rng_state(),
+                        "cuda": torch.cuda.get_rng_state_all(),
+                        "numpy": np.random.get_state(),
+                        "python": random.getstate()
+                    }
+                }
+                torch.save(checkpoint, checkpoint_path)
+    
+    # once in a while evaluate hellaswag
+    if (step % 250 == 0 or last_step) and (not use_compile):
+        num_correct_norm = 0
+        num_total = 0
+        for i, example in enumerate(iterate_examples("val")):
+            # only process examples where i % ddp_world_size == ddp_rank
+            if i % ddp_world_size != ddp_rank:
+                continue
+            # render the example into tokens and labels
+            _, tokens, mask, label = render_example(example)
+            tokens = tokens.to(device)
+            mask = mask.to(device)
+            # get the logits
+            with torch.no_grad():
+                with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+                    logits, loss = model(tokens)
+                pred_norm = GPTEvalUtilities.get_most_likely_row(tokens, mask, logits)
+            num_total += 1
+            num_correct_norm += int(pred_norm == label)
+        # reduce the stats across all processes
+        if ddp:
+            num_total = torch.tensor(num_total, dtype=torch.long, device=device)
+            num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device=device)
+            all_reduce(num_total, op=ReduceOp.SUM)
+            all_reduce(num_correct_norm, op=ReduceOp.SUM)
+            num_total = num_total.item()
+            num_correct_norm = num_correct_norm.item()
+        acc_norm = num_correct_norm / num_total
+        if master_process:
+            print(f"HellaSwag accuracy: {num_correct_norm}/{num_total}={acc_norm:.4f}")
+            with open(log_file, "a") as f:
+                f.write(f"{step} hella {acc_norm:.4f}\n")     
             
     # once in a while generate from the model (except step 0, which is noise)
     if ((step > 0 and step % 250 == 0) or last_step) and (not use_compile):
@@ -437,7 +511,5 @@ for step in range(MAX_STEPS):
 
 if ddp:
     destroy_process_group()
-
-
 
 sys.exit(0)
