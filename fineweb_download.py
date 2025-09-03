@@ -22,9 +22,8 @@ SHARD_SIZE = int(1e8) # 100M tokens per shard, total 100 shards
 
 
 def download_data():
-    return load_dataset("HuggingFaceFW/fineweb", name="sample=10BT", split='train')
+    return load_dataset("HuggingFaceFW/fineweb", name="sample-10BT", split='train')
 
-@staticmethod
 def tokenize(doc):
     # init the tokenizer
     enc = tiktoken.get_encoding('gpt2')
@@ -38,8 +37,7 @@ def tokenize(doc):
     
 
 def write_datafile(filename, tokens_np):
-    with open(filename, "wb") as f:
-        f.write(tokens_np.tobytes())
+    np.save(filename, tokens_np)
             
 def orcherstrate_dataset_downloading():
     os.makedirs(DATA_CACHE_DIR, exist_ok=True)
@@ -76,4 +74,7 @@ def orcherstrate_dataset_downloading():
                 # populate the next shard with the leftovers of the current doc
                 all_tokens_np[0:len(tokens)-remainder] = tokens[remainder:]
                 token_count = len(tokens)-remainder
-        
+
+
+if __name__ == '__main__':
+    orcherstrate_dataset_downloading()
