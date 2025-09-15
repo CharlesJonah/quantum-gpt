@@ -54,9 +54,9 @@ print(f"Using device - {device}")
 
 TOTAL_BATCH_SIZE = 524288 # 2**19  ~0.5M, to get a nice number that is a power of 2
 MAX_STEPS = 19073 # 10b tokens divided by 0.5M batch size. If you want to train 4 epochs, then multiply this number by 4
-MAX_LR = 6e-4 # as per gpt3 paper
-MIN_LR = MAX_LR * 0.1 # as per gpt3 paper
-WARM_STEPS = 715 # as per gpt3 paper
+MAX_LR = 3e-4
+MIN_LR = MAX_LR * 0.05
+WARM_STEPS = 4096
 MICRO_BATCH_SIZE = 16 # you can adjust this in multiples of 16 until what fits your GPU well
 SEQUENCE_LENGTH = 2048
 GRAD_ACCUM_STEPS = TOTAL_BATCH_SIZE // (MICRO_BATCH_SIZE * SEQUENCE_LENGTH * ddp_world_size)
@@ -89,7 +89,7 @@ class GPTTrainingUtilities:
     def get_lr(step):
         # Linear warmup for the warmup steps
         if step < WARM_STEPS:
-            return MAX_LR * (step + 1) / WARM_STEPS
+            return MAX_LR * (step + 64) / WARM_STEPS
         
         # If step > lr_decay_steps, then return min_lr
         if step > MAX_STEPS:
@@ -109,7 +109,7 @@ class GPTTrainingUtilities:
         # Load the checkpoint
         if os.path.exists(checkpoint_path):
             print(f"Loading checkpoint from {checkpoint_path}")
-            checkpoint = torch.load(checkpoint_path, map_location=device)
+            checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
             
             # Load model state
             model.load_state_dict(checkpoint['model'])
@@ -120,7 +120,7 @@ class GPTTrainingUtilities:
             train_loader.current_position = checkpoint['train_loader_curr_pos']
             train_loader.current_shard = checkpoint['train_loader_current_shard']
             
-            # Restore RNG states for reproducibility
+            # Restore RNG states for reproducibility  
             torch.set_rng_state(checkpoint['rng']['torch'])
             torch.cuda.set_rng_state_all(checkpoint['rng']['cuda'])
             np.random.set_state(checkpoint['rng']['numpy'])
@@ -448,8 +448,8 @@ if __name__ == "__main__":
                         'val_loss': val_loss_accum.item(),
                         'optimizer': optimizer.state_dict(),
                         "rng": {
-                            "torch": torch.get_rng_state(),
-                            "cuda": torch.cuda.get_rng_state_all(),
+                            "torch": torch.get_rng_state().cpu(),
+                            "cuda": [s.cpu() for s in torch.cuda.get_rng_state_all()],
                             "numpy": np.random.get_state(),
                             "python": random.getstate()
                         }
