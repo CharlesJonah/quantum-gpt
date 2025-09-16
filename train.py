@@ -54,11 +54,11 @@ print(f"Using device - {device}")
 
 TOTAL_BATCH_SIZE = 524288 # 2**19  ~0.5M, to get a nice number that is a power of 2
 MAX_STEPS = 19073 # 10b tokens divided by 0.5M batch size. If you want to train 4 epochs, then multiply this number by 4
-MAX_LR = 3e-4
-MIN_LR = MAX_LR * 0.05
-WARM_STEPS = 4096
-MICRO_BATCH_SIZE = 16 # you can adjust this in multiples of 16 until what fits your GPU well
-SEQUENCE_LENGTH = 2048
+MAX_LR = 6e-4
+MIN_LR = MAX_LR * 0.1
+WARM_STEPS = 1024 
+MICRO_BATCH_SIZE = 64 # you can adjust this in multiples of 16 until what fits your GPU well
+SEQUENCE_LENGTH = 1024
 GRAD_ACCUM_STEPS = TOTAL_BATCH_SIZE // (MICRO_BATCH_SIZE * SEQUENCE_LENGTH * ddp_world_size)
 
 class GPTEvalUtilities:
@@ -89,7 +89,7 @@ class GPTTrainingUtilities:
     def get_lr(step):
         # Linear warmup for the warmup steps
         if step < WARM_STEPS:
-            return MAX_LR * (step + 64) / WARM_STEPS
+            return MAX_LR * (step + 1) / WARM_STEPS
         
         # If step > lr_decay_steps, then return min_lr
         if step > MAX_STEPS:
@@ -121,8 +121,11 @@ class GPTTrainingUtilities:
             train_loader.current_shard = checkpoint['train_loader_current_shard']
             
             # Restore RNG states for reproducibility  
-            torch.set_rng_state(checkpoint['rng']['torch'])
-            torch.cuda.set_rng_state_all(checkpoint['rng']['cuda'])
+            torch.set_rng_state(torch.ByteTensor(checkpoint['rng']['torch'].cpu()))
+            
+            for i, s in enumerate(checkpoint['rng']['cuda']):
+                torch.cuda.set_rng_state(s.cpu(), device=i)
+            
             np.random.set_state(checkpoint['rng']['numpy'])
             random.setstate(checkpoint['rng']['python'])
             
@@ -181,7 +184,7 @@ class DataloaderLite:
     
 @dataclass
 class GPTConfig:
-    block_size: int = 2048
+    block_size: int = 1024
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
     n_head: int = 12
@@ -372,8 +375,8 @@ if __name__ == "__main__":
 
     assert TOTAL_BATCH_SIZE % (MICRO_BATCH_SIZE * SEQUENCE_LENGTH * ddp_world_size) == 0, "Make sure total batch size is divisible by MICRO_BATCH_SIZE * SEQUENCE_LENGTH * ddp_world_size"
     torch.set_float32_matmul_precision('high')
-    train_loader = DataloaderLite(16, 2048, ddp_rank, ddp_world_size, 'train')
-    val_loader = DataloaderLite(16, 2048, ddp_rank, ddp_world_size, 'val')
+    train_loader = DataloaderLite(64, 1024, ddp_rank, ddp_world_size, 'train')
+    val_loader = DataloaderLite(64, 1024, ddp_rank, ddp_world_size, 'val')
 
     # get logits
     model = GPT(GPTConfig())
