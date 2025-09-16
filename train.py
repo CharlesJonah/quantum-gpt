@@ -53,10 +53,10 @@ else:
 print(f"Using device - {device}")
 
 TOTAL_BATCH_SIZE = 524288 # 2**19  ~0.5M, to get a nice number that is a power of 2
-MAX_STEPS = 19073 # 10b tokens divided by 0.5M batch size. If you want to train 4 epochs, then multiply this number by 4
+MAX_STEPS = 19073 * 4 # 10b tokens divided by 0.5M batch size. If you want to train 4 epochs, then multiply this number by 4
 MAX_LR = 6e-4
 MIN_LR = MAX_LR * 0.1
-WARM_STEPS = 1024 
+WARM_STEPS = math.ceil(0.054 * MAX_STEPS) # ~5% of steps for warmup 
 MICRO_BATCH_SIZE = 64 # you can adjust this in multiples of 16 until what fits your GPU well
 SEQUENCE_LENGTH = 1024
 GRAD_ACCUM_STEPS = TOTAL_BATCH_SIZE // (MICRO_BATCH_SIZE * SEQUENCE_LENGTH * ddp_world_size)
