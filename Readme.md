@@ -9,3 +9,7 @@ The training has been done for 4 epochs across the whole 10b tokens
 Below are the results:
 
 ![loss curve and hellaswag eval curve](output.png)
+
+To train the model, run - `torchrun --standalone --nproc-per-node=8 train.py --resume False --last_checkpoint_step 0`
+
+To get output from the model(inferencing), run `python inference.py`
